@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.checkpoint import checkpoint as ckpt
 from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
 
 # --------------------------------------------------------------------------
 # 1. Dataset Pipeline for Triple-Layer Projections
@@ -530,7 +531,8 @@ def main():
 
         optimizer.zero_grad()  # zero once before accumulation loop
 
-        for step, (inputs, targets) in enumerate(train_loader):
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{args.epochs:02d} [train]", leave=False)
+        for step, (inputs, targets) in enumerate(train_pbar):
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
@@ -550,6 +552,9 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
 
+            # Update progress bar with running loss
+            train_pbar.set_postfix(loss=f"{train_loss_accum / max(1, step + 1):.4f}")
+
         scheduler.step()
         avg_train_loss = train_loss_accum / max(1, len(train_loader))
 
@@ -561,8 +566,9 @@ def main():
         model.eval()
         val_mae = 0.0
         val_psnr = 0.0
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{args.epochs:02d} [val]  ", leave=False)
         with torch.no_grad():
-            for inputs, targets in val_loader:
+            for inputs, targets in val_pbar:
                 inputs = inputs.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
 
@@ -570,6 +576,8 @@ def main():
                     preds = model(inputs)
                     val_mae += F.l1_loss(preds, targets).item()
                     val_psnr += compute_psnr(preds.float(), targets.float())
+
+                val_pbar.set_postfix(MAE=f"{val_mae / max(1, val_pbar.n):.5f}")
 
         avg_val_mae = val_mae / max(1, len(val_loader))
         avg_val_psnr = val_psnr / max(1, len(val_loader))
