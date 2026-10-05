@@ -476,7 +476,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scatter & Beam-Hardening Correction for Triple-Layer Detectors (low-mem)")
     parser.add_argument("--data_dir", type=str, default="/srv/data/forearm_data_for_madjid", help="Path to dataset directory")
     parser.add_argument("--model", type=str, default="cltfn", choices=["unet", "attentionunet", "cltfn"])
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size per step (default 4)")
     parser.add_argument("--accum_steps", type=int, default=4, help="Gradient accumulation steps to recover effective batch size")
     parser.add_argument("--crop_size", type=int, default=None, help="Spatial crop size (e.g. 512) to reduce activation memory on large images")
