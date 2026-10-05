@@ -398,39 +398,46 @@ class CLTFN(nn.Module):
         m_in = x[:, 1:2, :, :]
         b_in = x[:, 2:3, :, :]
 
-        # 1. Shared feature extraction (checkpointed per-layer to save memory)
-        f_t = ckpt(self.shared_enc, t_in, use_reentrant=False)
-        f_m = ckpt(self.shared_enc, m_in, use_reentrant=False)
-        f_b = ckpt(self.shared_enc, b_in, use_reentrant=False)
+        # 1. Pool each layer's features for tokenization, then discard the
+        #    full-resolution feature map immediately.  We recompute it later
+        #    (step 4) so only ONE full-res feature map is alive at a time.
+        p_t = self.adaptive_pool(ckpt(self.shared_enc, t_in, use_reentrant=False)).flatten(2).transpose(1, 2)
+        p_m = self.adaptive_pool(ckpt(self.shared_enc, m_in, use_reentrant=False)).flatten(2).transpose(1, 2)
+        p_b = self.adaptive_pool(ckpt(self.shared_enc, b_in, use_reentrant=False)).flatten(2).transpose(1, 2)
 
-        # 2. Tokenization & Sequence Concatenation
-        p_t = self.adaptive_pool(f_t).flatten(2).transpose(1, 2)  # (B, N, emb_dim)
-        p_m = self.adaptive_pool(f_m).flatten(2).transpose(1, 2)
-        p_b = self.adaptive_pool(f_b).flatten(2).transpose(1, 2)
-
-        tokens = torch.cat([p_t, p_m, p_b], dim=1) + self.pos_emb  # (B, 3N, emb_dim)
-
-        # 3. Cross-Layer Global Self-Attention (checkpointed)
+        # 2. Token sequence & cross-layer self-attention
+        tokens = torch.cat([p_t, p_m, p_b], dim=1) + self.pos_emb
+        del p_t, p_m, p_b
         fused = ckpt(self.transformer, tokens, use_reentrant=False)
+        del tokens
 
-        # 4. Partition back to layer representations
+        # 3. Partition fused tokens back to per-layer grids
         n_tokens = self.pool_grid * self.pool_grid
-        fused_t = fused[:, :n_tokens, :].transpose(1, 2).view(B, self.emb_dim, self.pool_grid, self.pool_grid)
-        fused_m = fused[:, n_tokens:2*n_tokens, :].transpose(1, 2).view(B, self.emb_dim, self.pool_grid, self.pool_grid)
-        fused_b = fused[:, 2*n_tokens:, :].transpose(1, 2).view(B, self.emb_dim, self.pool_grid, self.pool_grid)
+        fused_parts = [
+            fused[:, :n_tokens, :],
+            fused[:, n_tokens:2*n_tokens, :],
+            fused[:, 2*n_tokens:, :],
+        ]
+        del fused
 
-        # 5. Residual feature fusion
-        target_size = (f_t.size(2), f_t.size(3))
-        res_t = f_t + F.interpolate(fused_t, size=target_size, mode="bilinear", align_corners=False)
-        res_m = f_m + F.interpolate(fused_m, size=target_size, mode="bilinear", align_corners=False)
-        res_b = f_b + F.interpolate(fused_b, size=target_size, mode="bilinear", align_corners=False)
+        # 4. For each layer: recompute encoder features → residual fuse → decode → free
+        #    Only ONE full-resolution feature map lives in memory at a time.
+        decoders = [self.dec_top, self.dec_mid, self.dec_bot]
+        outs = []
+        for inp, fp, dec in zip([t_in, m_in, b_in], fused_parts, decoders):
+            feat = ckpt(self.shared_enc, inp, use_reentrant=False)
+            target_size = (feat.size(2), feat.size(3))
+            fused_up = F.interpolate(
+                fp.transpose(1, 2).view(B, self.emb_dim, self.pool_grid, self.pool_grid),
+                size=target_size, mode="bilinear", align_corners=False
+            )
+            res = feat + fused_up
+            del feat, fused_up
+            outs.append(ckpt(dec, res, use_reentrant=False))
+            del res
 
-        # 6. Reconstruct each layer (checkpointed)
-        out_t = ckpt(self.dec_top, res_t, use_reentrant=False)
-        out_m = ckpt(self.dec_mid, res_m, use_reentrant=False)
-        out_b = ckpt(self.dec_bot, res_b, use_reentrant=False)
-
-        out = torch.cat([out_t, out_m, out_b], dim=1)
+        out = torch.cat(outs, dim=1)
+        del outs
         if out.shape[-2:] != (H, W):
             out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
         return out
@@ -469,8 +476,9 @@ def main():
     parser.add_argument("--data_dir", type=str, default="/srv/data/forearm_data_for_madjid", help="Path to dataset directory")
     parser.add_argument("--model", type=str, default="cltfn", choices=["unet", "attentionunet", "cltfn"])
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per step (default 8, was 16)")
-    parser.add_argument("--accum_steps", type=int, default=2, help="Gradient accumulation steps to recover effective batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per step (default 4)")
+    parser.add_argument("--accum_steps", type=int, default=4, help="Gradient accumulation steps to recover effective batch size")
+    parser.add_argument("--crop_size", type=int, default=None, help="Spatial crop size (e.g. 512) to reduce activation memory on large images")
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--half_channels", action="store_true", help="Halve model channel widths for extra memory savings")
@@ -482,9 +490,13 @@ def main():
     print(f"[*] Loading data from: {args.data_dir}")
     print(f"[*] Batch size: {args.batch_size} | Accumulation steps: {args.accum_steps} | Effective batch: {args.batch_size * args.accum_steps}")
     print(f"[*] Half channels: {args.half_channels}")
+    if args.crop_size:
+        print(f"[*] Crop size: {args.crop_size}x{args.crop_size}")
+    print("[*] Tip: if OOM persists, run with:  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
 
     # Dataset & Dataloaders
-    dataset = TripleLayerForearmDataset(data_root=args.data_dir)
+    crop = (args.crop_size, args.crop_size) if args.crop_size else None
+    dataset = TripleLayerForearmDataset(data_root=args.data_dir, crop_size=crop)
     val_size = max(1, int(0.2 * len(dataset)))
     train_size = len(dataset) - val_size
     train_set, val_set = random_split(dataset, [train_size, val_size])
@@ -528,22 +540,21 @@ def main():
                 loss, loss_components = criterion(preds, targets)
                 loss = loss / args.accum_steps  # scale for accumulation
 
+            train_loss_accum += loss.item() * args.accum_steps  # unscale for logging
+
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
-
-            # Step optimizer every accum_steps
+            del preds, loss  # free forward-pass activations immediately
             if (step + 1) % args.accum_steps == 0 or (step + 1) == len(train_loader):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            train_loss_accum += loss.item() * args.accum_steps  # unscale for logging
-
         scheduler.step()
         avg_train_loss = train_loss_accum / max(1, len(train_loader))
 
         # Free training memory before validation
-        del inputs, targets, preds, loss
+        del inputs, targets
         torch.cuda.empty_cache()
 
         # Evaluation Loop
